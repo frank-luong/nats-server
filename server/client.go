@@ -233,6 +233,7 @@ type client struct {
 	gw    *gateway
 	leaf  *leaf
 	ws    *websocket
+	mqtt  *mqtt
 
 	// To keep track of gateway replies mapping
 	gwrm map[string]*gwReplyMap
@@ -504,6 +505,8 @@ func (c *client) initClient() {
 		name := "cid"
 		if c.ws != nil {
 			name = "wid"
+		} else if c.mqtt != nil {
+			name = "mid"
 		}
 		c.ncs = fmt.Sprintf("%s - %s:%d", conn, name, c.cid)
 	case ROUTER:
@@ -895,6 +898,9 @@ func (c *client) readLoop(pre []byte) {
 	}
 	nc := c.nc
 	ws := c.ws != nil
+	if c.mqtt != nil {
+		c.mqtt.r = &mqttReader{reader: nc}
+	}
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -1573,7 +1579,6 @@ func (c *client) processConnect(arg []byte) error {
 			// By default register with the global account.
 			c.registerWithAccount(srv.globalAccount())
 		}
-
 	}
 
 	switch kind {
@@ -1593,7 +1598,6 @@ func (c *client) processConnect(arg []byte) error {
 			c.sendErr(ErrNoRespondersRequiresHeaders.Error())
 			c.closeConnection(NoRespondersRequiresHeaders)
 			return ErrNoRespondersRequiresHeaders
-
 		}
 		if verbose {
 			c.sendOK()
@@ -1868,7 +1872,9 @@ func (c *client) sendErr(err string) {
 	if c.trace {
 		c.traceOutOp("-ERR", []byte(err))
 	}
-	c.enqueueProto([]byte(fmt.Sprintf(errProto, err)))
+	if c.mqtt == nil {
+		c.enqueueProto([]byte(fmt.Sprintf(errProto, err)))
+	}
 	c.mu.Unlock()
 }
 
@@ -3794,7 +3800,7 @@ func (c *client) processPingTimer() {
 
 // Lock should be held
 func (c *client) setPingTimer() {
-	if c.srv == nil {
+	if c.srv == nil || c.mqtt != nil {
 		return
 	}
 	d := c.srv.getOpts().PingInterval
