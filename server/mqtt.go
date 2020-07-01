@@ -18,12 +18,13 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"github.com/nats-io/nuid"
 	"io"
 	"net"
 	"strconv"
 	"time"
 	"unicode/utf8"
+
+	"github.com/nats-io/nuid"
 )
 
 // References to "spec" here is from https://docs.oasis-open.org/mqtt/mqtt/v3.1.1/os/mqtt-v3.1.1-os.pdf
@@ -64,6 +65,7 @@ const (
 
 	// Subscribe flags
 	mqttSubscribeFlags = byte(0x2)
+	mqttSubAckFailure  = byte(0x80)
 
 	// ConnAck returned codes
 	mqttConnAckRCConnectionAccepted          = byte(0x0)
@@ -233,6 +235,7 @@ func (c *client) mqttParse(buf []byte) error {
 	var err error
 	var b byte
 	var pl int
+	var flush bool
 
 	for err == nil && r.hasMore() {
 
@@ -261,13 +264,20 @@ func (c *client) mqttParse(buf []byte) error {
 			var pqos byte
 			pi, pqos, err = c.mqttParsePub(r, b, pl)
 			if trace {
-				c.traceInOp("PUB", errOrTrace(err, c.mqttPubTrace(pi, pqos)))
+				c.traceInOp("PUBLISH", errOrTrace(err, c.mqttPubTrace(pi, pqos)))
 				if err == nil {
 					c.traceMsg(c.msgBuf)
 				}
 			}
 			if err == nil {
 				c.mqttProcessPub(pi, pqos)
+				if pqos == 1 {
+					c.mqttEnqueuePubAck(pi)
+					if trace {
+						c.traceOutOp("PUBACK", []byte(fmt.Sprintf("pi=%v", pi)))
+					}
+					flush = true
+				}
 			}
 		case mqttPacketPubAck:
 			// if p, err = pkg.ParsePubAck(r, b, rl); err == nil {
@@ -281,10 +291,15 @@ func (c *client) mqttParse(buf []byte) error {
 			var filters []*mqttFilter
 			pi, filters, err = c.mqttParseSubs(r, b, pl)
 			if trace {
-				c.traceInOp("SUB", errOrTrace(err, mqttSubscribeTrace(filters)))
+				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(filters)))
 			}
 			if err == nil {
-				err = c.mqttProcessSubs(pi, filters)
+				c.mqttProcessSubs(pi, filters)
+				if trace {
+					c.traceOutOp("SUBACK", []byte(mqttSubscribeTrace(filters)))
+				}
+				c.mqttEnqueueSubAck(pi, filters)
+				flush = true
 			}
 		// case mqttPacketUnsub:
 		// if p, err = pkg.ParseUnsubscribe(r, b, rl); err == nil {
@@ -293,11 +308,11 @@ func (c *client) mqttParse(buf []byte) error {
 		// }
 		case mqttPacketPing:
 			if trace {
-				c.traceInOp("PING", nil)
+				c.traceInOp("PINGREQ", nil)
 			}
 			c.mqttEnqueuePingResp()
 			if trace {
-				c.traceOutOp("PONG", nil)
+				c.traceOutOp("PINGRESP", nil)
 			}
 		case mqttPacketConnect:
 			// It is an error to receive a second connect packet
@@ -320,12 +335,18 @@ func (c *client) mqttParse(buf []byte) error {
 			// We need to send a ConnAck on success or if we are given a return code.
 			if err == nil || rc != 0 {
 				c.mqttEnqueueConnAck(rc)
+				if trace {
+					c.traceOutOp("CONNACK", []byte(fmt.Sprintf("rc=%x", rc)))
+				}
 			}
 			// The readLoop will not call closeConnection for this error...
 			if err == ErrAuthentication {
 				c.closeConnection(AuthenticationViolation)
 			}
 		case mqttPacketDisconnect:
+			if trace {
+				c.traceInOp("DISCONNECT", nil)
+			}
 			// Normal disconnect, we need to discard the will.
 			// Spec [MQTT-3.1.2-8]
 			c.mu.Lock()
@@ -344,6 +365,11 @@ func (c *client) mqttParse(buf []byte) error {
 		default:
 			err = fmt.Errorf("received unknown packet type %d", pt>>4)
 		}
+	}
+	if flush {
+		c.mu.Lock()
+		c.flushSignal()
+		c.mu.Unlock()
 	}
 	if err == nil && rd > 0 {
 		r.reader.SetReadDeadline(time.Now().Add(rd))
@@ -617,7 +643,7 @@ func (c *client) mqttParsePub(r *mqttReader, flags byte, pl int) (uint16, byte, 
 func (c *client) mqttPubTrace(pi uint16, qos byte) string {
 	trace := fmt.Sprintf("%s", c.pa.subject)
 	if pi > 0 {
-		trace += fmt.Sprintf(" pid=%v", pi)
+		trace += fmt.Sprintf(" pi=%v", pi)
 	}
 	trace += fmt.Sprintf(" %v", len(c.msgBuf)-LEN_CR_LF)
 	return trace
@@ -647,6 +673,15 @@ func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string,
 		w.WriteUint16(pid)
 	}
 	w.Write([]byte(payload))
+}
+
+func (c *client) mqttEnqueuePubAck(pi uint16) {
+	proto := [4]byte{mqttPacketPubAck, 0x2, 0, 0}
+	proto[2] = byte(pi >> 8)
+	proto[3] = byte(pi)
+	c.mu.Lock()
+	c.enqueueProto(proto[:4])
+	c.mu.Unlock()
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -715,8 +750,53 @@ func mqttSubscribeTrace(filters []*mqttFilter) string {
 	return trace
 }
 
-func (c *client) mqttProcessSubs(pi uint16, filters []*mqttFilter) error {
-	return nil
+func mqttDeliverMsgCb(sub *subscription, client *client, subject, _ string, msg []byte) {
+
+}
+
+func (c *client) mqttProcessSubs(pi uint16, filters []*mqttFilter) {
+	subacks := make([]byte, len(filters))
+	// Note: we will update the filter's qos so that we can trace
+	// the SUBACK with the returned results.
+	for i, f := range filters {
+		// Spec [MQTT-3.8.4-3] says that if an exact same subscription is
+		// found, it needs to be replaced with the new one (possibly updating
+		// the qos) and that the flow of publications must not be interrupted,
+		// which I read as the replacement cannot be a remove then add if there
+		// is a chance that in between the 2 actions, published messages
+		// would be "lost" because there would not be any matching subscription.
+		sub, err := c.processSub([]byte(fmt.Sprintf("%s %s", f.filter, f.filter)), true)
+		if sub == nil || err != nil {
+			if err == nil {
+				err = fmt.Errorf("malformed subject")
+			}
+			c.Errorf("error subscribing to %q: err=%v", f.filter, err)
+			f.qos = mqttSubAckFailure
+			subacks[i] = mqttSubAckFailure
+			continue
+		}
+		c.mu.Lock()
+		if f.qos > 1 {
+			f.qos = 1
+		}
+		sub.qos = f.qos
+		sub.icb = mqttDeliverMsgCb
+		c.mu.Unlock()
+	}
+}
+
+func (c *client) mqttEnqueueSubAck(pi uint16, filters []*mqttFilter) {
+	w := &mqttWriter{}
+	w.WriteByte(mqttPacketSubAck)
+	// packet length is 2 (for packet identifier) and 1 byte per filter.
+	w.WriteVarInt(2 + len(filters))
+	w.WriteUint16(pi)
+	for _, f := range filters {
+		w.WriteByte(f.qos)
+	}
+	c.mu.Lock()
+	c.queueOutbound(w.Bytes())
+	c.mu.Unlock()
 }
 
 //////////////////////////////////////////////////////////////////////////////

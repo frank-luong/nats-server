@@ -407,6 +407,7 @@ type subscription struct {
 	max     int64
 	qw      int32
 	closed  int32
+	qos     byte // quality of service (for mqtt)
 }
 
 // Indicate that this subscription is closed.

@@ -222,6 +222,13 @@ func testMQTTRead(c net.Conn) ([]byte, error) {
 	return copyBytes(buf[:n]), nil
 }
 
+func testMQTTWrite(c net.Conn, buf []byte) (int, error) {
+	c.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	n, err := c.Write(buf)
+	c.SetWriteDeadline(time.Time{})
+	return n, err
+}
+
 func testMQTTConnect(t testing.TB, ci *mqttConnInfo, host string, port int) (net.Conn, *mqttReader) {
 	t.Helper()
 
@@ -232,7 +239,7 @@ func testMQTTConnect(t testing.TB, ci *mqttConnInfo, host string, port int) (net
 	}
 
 	proto := mqttCreateConnectProto(ci)
-	if _, err := c.Write(proto); err != nil {
+	if _, err := testMQTTWrite(c, proto); err != nil {
 		t.Fatalf("Error writing connect: %v", err)
 	}
 
@@ -413,7 +420,7 @@ func TestMQTTTLSVerifyAndMap(t *testing.T) {
 
 			ci := &mqttConnInfo{cleanSess: true}
 			proto := mqttCreateConnectProto(ci)
-			if _, err := mc.Write(proto); err != nil {
+			if _, err := testMQTTWrite(mc, proto); err != nil {
 				t.Fatalf("Error sending proto: %v", err)
 			}
 			buf, err := testMQTTRead(mc)
@@ -590,7 +597,7 @@ func TestMQTTAuthTimeout(t *testing.T) {
 				pass:      "client",
 			}
 			proto := mqttCreateConnectProto(ci)
-			if _, err := mc.Write(proto); err != nil {
+			if _, err := testMQTTWrite(mc, proto); err != nil {
 				if test.ok {
 					t.Fatalf("Error sending connect: %v", err)
 				}
@@ -923,7 +930,7 @@ func TestMQTTPubMQTTSubNATS(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			w := &mqttWriter{}
 			mqttWritePublish(w, 0, false, false, test.mqttTopic, 0, []byte("hello"))
-			if _, err := mc.Write(w.Bytes()); err != nil {
+			if _, err := testMQTTWrite(mc, w.Bytes()); err != nil {
 				t.Fatalf("Error publishing: %v", err)
 			}
 			msg := natsNexMsg(t, sub, time.Second)
@@ -933,6 +940,91 @@ func TestMQTTPubMQTTSubNATS(t *testing.T) {
 			}
 		})
 	}
+}
+
+func testMQTTReaderHasAtLeastOne(t testing.TB, r *mqttReader) {
+	r.reader.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := r.ensurePacketInBuffer(1); err != nil {
+		t.Fatal(err)
+	}
+	r.reader.SetReadDeadline(time.Time{})
+}
+
+func testMQTTSub(t testing.TB, pi uint16, c net.Conn, r *mqttReader, filters []*mqttFilter, expected []byte) {
+	t.Helper()
+	w := &mqttWriter{}
+	pkLen := 2 // for pi
+	for i := 0; i < len(filters); i++ {
+		f := filters[i]
+		pkLen += 2 + len(f.filter) + 1
+	}
+	w.WriteByte(mqttPacketSub | mqttSubscribeFlags)
+	w.WriteVarInt(pkLen)
+	w.WriteUint16(pi)
+	for i := 0; i < len(filters); i++ {
+		f := filters[i]
+		w.WriteBytes(f.filter)
+		w.WriteByte(f.qos)
+	}
+	if _, err := testMQTTWrite(c, w.Bytes()); err != nil {
+		t.Fatalf("Error writing SUBSCRIBE protocol: %v", err)
+	}
+	// Make sure we have at least 1 byte in buffer (if not will read)
+	testMQTTReaderHasAtLeastOne(t, r)
+	// Parse SUBACK
+	b, err := r.readByte("packet type")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pt := b & mqttPacketMask; pt != mqttPacketSubAck {
+		t.Fatalf("Expected SUBACK packet %x, got %x", mqttPacketSubAck, pt)
+	}
+	pl, err := r.readPacketLen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ensurePacketInBuffer(pl); err != nil {
+		t.Fatal(err)
+	}
+	rpi, err := r.readUint16("packet identifier")
+	if err != nil || rpi != pi {
+		t.Fatalf("Error with packet identifier expected=%v got: %v err=%v", pi, rpi, err)
+	}
+	for i, rem := 0, pl-2; rem > 0; rem-- {
+		qos, err := r.readByte("filter qos")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if qos != expected[i] {
+			t.Fatalf("For topic filter %q expected qos of %v, got %v",
+				filters[i].filter, expected[i], qos)
+		}
+		i++
+	}
+}
+
+func TestMQTTSubAck(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	subs := []*mqttFilter{
+		{filter: []byte("foo"), qos: 0},
+		{filter: []byte("bar"), qos: 1},
+		{filter: []byte("baz"), qos: 2},       // Since we don't support, we should receive a result of 1
+		{filter: []byte("foo/#/bar"), qos: 0}, // Invalid sub, so we should receive a result of mqttSubAckFailure
+	}
+	expected := []byte{
+		0,
+		1,
+		1,
+		mqttSubAckFailure,
+	}
+	testMQTTSub(t, 1, mc, r, subs, expected)
 }
 
 // Benchmarks
