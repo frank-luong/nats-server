@@ -97,6 +97,7 @@ type srvMQTT struct {
 type mqtt struct {
 	r     *mqttReader
 	cp    *mqttConnectProto
+	sid   uint32
 	sessp bool // session present
 }
 
@@ -129,7 +130,6 @@ type mqttWill struct {
 
 type mqttFilter struct {
 	filter []byte
-	copied bool
 	qos    byte
 }
 
@@ -294,7 +294,7 @@ func (c *client) mqttParse(buf []byte) error {
 				c.traceInOp("SUBSCRIBE", errOrTrace(err, mqttSubscribeTrace(filters)))
 			}
 			if err == nil {
-				c.mqttProcessSubs(pi, filters)
+				c.mqttProcessSubs(mqtt, pi, filters)
 				if trace {
 					c.traceOutOp("SUBACK", []byte(mqttSubscribeTrace(filters)))
 				}
@@ -508,9 +508,13 @@ func (c *client) mqttParseConnect(r *mqttReader, pl int) (byte, *mqttConnectProt
 			return 0, nil, fmt.Errorf("invalide utf8 for Will topic %q", topic)
 		}
 		// Convert MQTT topic to NATS subject
-		_, topic, err = mqttTopicToNATSPubSubject(topic, true)
+		var copied bool
+		copied, topic, err = mqttTopicToNATSPubSubject(topic)
 		if err != nil {
 			return 0, nil, err
+		}
+		if !copied {
+			topic = copyBytes(topic)
 		}
 		cp.will.topic = topic
 		// Now will message
@@ -606,11 +610,14 @@ func (c *client) mqttParsePub(r *mqttReader, flags byte, pl int) (uint16, byte, 
 	if err != nil {
 		return 0, 0, err
 	}
+	if len(topic) == 0 {
+		return 0, 0, fmt.Errorf("topic cannot be empty")
+	}
 	// We don't ask for a copy since after processing of the publish,
 	// we don't need the subject anymore. However, the conversion may
 	// still return a copy if had to expand the subject due to the
 	// MQTT specific topic name rules.
-	_, topic, err = mqttTopicToNATSPubSubject(topic, false)
+	_, topic, err = mqttTopicToNATSPubSubject(topic)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -654,7 +661,7 @@ func (c *client) mqttProcessPub(pi uint16, qos byte) {
 	c.msgBuf, c.pa.subject, c.pa.hdr, c.pa.size, c.pa.szb = nil, nil, -1, 0, nil
 }
 
-func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string, pid uint16, payload []byte) {
+func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string, pi uint16, payload []byte) {
 	flags := qos << 1
 	if dup {
 		flags |= mqttPubFlagDup
@@ -670,7 +677,7 @@ func mqttWritePublish(w *mqttWriter, qos byte, dup, retain bool, subject string,
 	w.WriteVarInt(pkLen)
 	w.WriteString(subject)
 	if qos > 0 {
-		w.WriteUint16(pid)
+		w.WriteUint16(pi)
 	}
 	w.Write([]byte(payload))
 }
@@ -715,8 +722,7 @@ func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFi
 		if !utf8.Valid(filter) {
 			return 0, nil, fmt.Errorf("invalid utf8 for topic filter %q", filter)
 		}
-		var cp bool
-		cp, filter, err = mqttFilterToNATSSubject(filter, false)
+		_, filter, err = mqttFilterToNATSSubject(filter)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -728,7 +734,7 @@ func (c *client) mqttParseSubs(r *mqttReader, b byte, pl int) (uint16, []*mqttFi
 		if qos > 2 {
 			return 0, nil, fmt.Errorf("subscribe QoS value must be 0, 1 or 2, got %v", qos)
 		}
-		filters = append(filters, &mqttFilter{filter, cp, qos})
+		filters = append(filters, &mqttFilter{filter, qos})
 	}
 	// Spec [MQTT-3.8.3-3]
 	if len(filters) == 0 {
@@ -750,11 +756,30 @@ func mqttSubscribeTrace(filters []*mqttFilter) string {
 	return trace
 }
 
-func mqttDeliverMsgCb(sub *subscription, client *client, subject, _ string, msg []byte) {
-
+func mqttDeliverMsgCb(sub *subscription, producer *client, subject, _ string, msg []byte) {
+	sw := mqttWriter{}
+	w := &sw
+	// TODO: add qos/dup/retain flags
+	flags := byte(0)
+	w.WriteByte(mqttPacketPub | flags)
+	topic := mqttFromNATSPubSubject(subject)
+	// TODO: add 2 for packet identifier if qos>0
+	pkLen := 2 + len(topic) + len(msg)
+	w.WriteVarInt(pkLen)
+	// TODO: packet identifier
+	w.WriteBytes(topic)
+	w.Write(msg)
+	csub := sub.client
+	csub.mu.Lock()
+	csub.queueOutbound(w.Bytes())
+	if _, ok := producer.pcd[csub]; !ok {
+		csub.out.fsp++
+		producer.pcd[csub] = needFlush
+	}
+	csub.mu.Unlock()
 }
 
-func (c *client) mqttProcessSubs(pi uint16, filters []*mqttFilter) {
+func (c *client) mqttProcessSubs(mqtt *mqtt, pi uint16, filters []*mqttFilter) {
 	subacks := make([]byte, len(filters))
 	// Note: we will update the filter's qos so that we can trace
 	// the SUBACK with the returned results.
@@ -765,23 +790,38 @@ func (c *client) mqttProcessSubs(pi uint16, filters []*mqttFilter) {
 		// which I read as the replacement cannot be a remove then add if there
 		// is a chance that in between the 2 actions, published messages
 		// would be "lost" because there would not be any matching subscription.
-		sub, err := c.processSub([]byte(fmt.Sprintf("%s %s", f.filter, f.filter)), true)
+		subject := f.filter
+	CREATE_SUB:
+		mqtt.sid++
+		sub, err := c.processSub([]byte(fmt.Sprintf("%s %v", subject, mqtt.sid)), true)
 		if sub == nil || err != nil {
 			if err == nil {
 				err = fmt.Errorf("malformed subject")
 			}
-			c.Errorf("error subscribing to %q: err=%v", f.filter, err)
+			c.Errorf("error subscribing to %q: err=%v", subject, err)
 			f.qos = mqttSubAckFailure
 			subacks[i] = mqttSubAckFailure
 			continue
 		}
 		c.mu.Lock()
+		// If already exist, sub.icb would not be nil
+		newSub := sub.icb == nil
 		if f.qos > 1 {
 			f.qos = 1
 		}
 		sub.qos = f.qos
-		sub.icb = mqttDeliverMsgCb
+		createShadow := false
+		if newSub {
+			sub.icb = mqttDeliverMsgCb
+			if len(subject) > 1 && subject[len(subject)-1] == fwc {
+				subject = subject[:len(subject)-2]
+				createShadow = true
+			}
+		}
 		c.mu.Unlock()
+		if createShadow {
+			goto CREATE_SUB
+		}
 	}
 }
 
@@ -833,8 +873,8 @@ func errOrTrace(err error, trace string) []byte {
 
 // Converts an MQTT Topic Name to a NATS Subject (used by PUBLISH)
 // See mqttToNATSSubjectConversion() for details.
-func mqttTopicToNATSPubSubject(mt []byte, cp bool) (bool, []byte, error) {
-	return mqttToNATSSubjectConversion(mt, cp, false)
+func mqttTopicToNATSPubSubject(mt []byte) (bool, []byte, error) {
+	return mqttToNATSSubjectConversion(mt, false)
 }
 
 // Converts an MQTT Topic Filter to a NATS Subject (used by SUBSCRIBE)
@@ -843,8 +883,8 @@ func mqttTopicToNATSPubSubject(mt []byte, cp bool) (bool, []byte, error) {
 // Differences with NATS: in MQTT, subscribing to "foo/#" is not entirely
 // equivalent to "foo.>" because in MQTT, foo/bar matches "foo/#", but so
 // does "foo/" or "foo".
-func mqttFilterToNATSSubject(filter []byte, cp bool) (bool, []byte, error) {
-	return mqttToNATSSubjectConversion(filter, cp, true)
+func mqttFilterToNATSSubject(filter []byte) (bool, []byte, error) {
+	return mqttToNATSSubjectConversion(filter, true)
 }
 
 // Converts an MQTT Topic Name or Filter to a NATS Subject
@@ -864,13 +904,10 @@ func mqttFilterToNATSSubject(filter []byte, cp bool) (bool, []byte, error) {
 // If `cp` is true, a copy is returned. If not, the returned slice
 // may still be a copy of `mt` due to the rules described above. In that
 // case the first returned field indicates if the result is a copy or not.
-func mqttToNATSSubjectConversion(mt []byte, cp, wcOk bool) (bool, []byte, error) {
+func mqttToNATSSubjectConversion(mt []byte, wcOk bool) (bool, []byte, error) {
 	if len(mt) == 1 {
 		if mt[0] == btsep {
 			mt[0] = mqttTopicLevelSep
-		}
-		if cp {
-			return true, copyBytes(mt), nil
 		}
 		return false, mt, nil
 	}
@@ -922,17 +959,37 @@ func mqttToNATSSubjectConversion(mt []byte, cp, wcOk bool) (bool, []byte, error)
 		}
 		j++
 	}
-	// Not asked to copy, return res and indicate if this is actually a copy
-	if !cp {
-		return newSlice, res, nil
+	// newSlice will indicate if we have made a copy
+	return newSlice, res, nil
+}
+
+func mqttFromNATSPubSubject(subject string) []byte {
+	// Handle the special cases of first 2 bytes being "/." and/or last 2 bytes "./"
+	topic := []byte(subject)
+	start, end := 0, len(topic)
+	if len(subject) > 2 {
+		if subject[:2] == "/." {
+			topic = topic[1:]
+			topic[0] = mqttTopicLevelSep
+			start = 1
+			end = len(topic)
+		}
+		if subject[len(subject)-2:] == "./" {
+			topic = topic[:len(topic)-1]
+			end = len(topic) - 1
+			topic[end] = mqttTopicLevelSep
+		}
 	}
-	// If we are asked to copy but we had to create a new slice, it
-	// is already copied, so return 'res'
-	if newSlice {
-		return true, res, nil
+	for i := start; i < end; i++ {
+		switch topic[i] {
+		case mqttTopicLevelSep:
+			topic[i] = btsep
+		case btsep:
+			topic[i] = mqttTopicLevelSep
+		default:
+		}
 	}
-	// Return a copy of res (which is same than mt).
-	return true, copyBytes(res), nil
+	return topic
 }
 
 //////////////////////////////////////////////////////////////////////////////

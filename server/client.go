@@ -2134,7 +2134,12 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 	acc := c.acc
 	srv := c.srv
 
-	sid := string(sub.sid)
+	var sid string
+	if c.mqtt != nil {
+		sid = string(sub.subject)
+	} else {
+		sid = string(sub.sid)
+	}
 
 	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
 	if c.isClosed() && (kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT) {
