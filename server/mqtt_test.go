@@ -927,6 +927,7 @@ func TestMQTTTopicConversion(t *testing.T) {
 		{"slash last is dot slash", "foo/", "foo./"},
 		{"slash last is dot slash with several sep", "foo/bar/", "foo.bar./"},
 		{"slash is first and last", "/foo/bar/baz/", "/.foo.bar.baz./"},
+		{"topic has dot and slash last", "foo./", "foo/./"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			w := &mqttWriter{}
@@ -1218,6 +1219,161 @@ func TestMQTTSub(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMQTTSubDups(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	nc := natsConnect(t, s.ClientURL())
+	defer nc.Close()
+
+	mcp, mpr := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mcp.Close()
+	testMQTTCheckConnAck(t, mpr, mqttConnAckRCConnectionAccepted, false)
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{user: "sub", cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	// Test with single SUBSCRIBE protocol but multiple filters
+	filters := []*mqttFilter{
+		&mqttFilter{filter: []byte("foo"), qos: 1},
+		&mqttFilter{filter: []byte("foo"), qos: 0},
+	}
+	testMQTTSub(t, 1, mc, r, filters, []byte{1, 0})
+	testMQTTFlush(t, mc, nil, r)
+
+	// And also with separate SUBSCRIBE protocols
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("bar"), qos: 0}}, []byte{0})
+	// Ask for QoS 2 but server will downgrade to 1
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("bar"), qos: 2}}, []byte{1})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Publish and test msg received only once
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+	testMQTTExpectNothing(t, r)
+
+	testMQTTPublish(t, mcp, r, 0, false, false, "bar", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "bar", 0, []byte("msg"))
+	testMQTTExpectNothing(t, r)
+
+	// Check that the QoS for subscriptions have been updated to the latest received filter
+	var err error
+	var subc *client
+	s.mu.Lock()
+	for _, c := range s.clients {
+		c.mu.Lock()
+		if c.opts.Username == "sub" {
+			subc = c
+			if sub := c.subs["foo"]; sub == nil || sub.qos != 0 {
+				err = fmt.Errorf("subscription foo QoS should be 0, got %v", sub.qos)
+			}
+			if err == nil {
+				if sub := c.subs["bar"]; sub == nil || sub.qos != 1 {
+					err = fmt.Errorf("subscription bar QoS should be 1, got %v", sub.qos)
+				}
+			}
+		}
+		c.mu.Unlock()
+		if subc != nil {
+			break
+		}
+	}
+	s.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Now subscribe on "foo/#" which means that a PUBLISH on "foo" will be received
+	// by this subscription and also the one on "foo".
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo/#"), qos: 1}}, []byte{1})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Publish and test msg received twice
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+
+	checkWCSub := func(expectedQoS byte) {
+		t.Helper()
+
+		subc.mu.Lock()
+		defer subc.mu.Unlock()
+
+		// We should have a subscription with key "foo.>" and "foo fwc"
+		// along with existing "foo" and "bar"
+		if lenmap := len(subc.subs); lenmap != 4 {
+			t.Fatalf("Subs map should have 4 entries, got %v", lenmap)
+		}
+		if sub, ok := subc.subs["foo.>"]; !ok {
+			t.Fatal("Expected sub foo.> to be present but was not")
+		} else if sub.qos != expectedQoS {
+			t.Fatalf("Expected sub foo.> QoS to be %v, got %v", expectedQoS, sub.qos)
+		}
+		if sub, ok := subc.subs["foo fwc"]; !ok {
+			t.Fatal("Expected sub foo fwc to be present but was not")
+		} else if sub.qos != expectedQoS {
+			t.Fatalf("Expected sub foo fwc QoS to be %v, got %v", expectedQoS, sub.qos)
+		}
+		// Make sure existing sub on "foo" qos was not changed.
+		if sub, ok := subc.subs["foo"]; !ok {
+			t.Fatal("Expected sub foo to be present but was not")
+		} else if sub.qos != 0 {
+			t.Fatalf("Expected sub foo QoS to be 0, got %v", sub.qos)
+		}
+	}
+	checkWCSub(1)
+
+	// Sub again on same subject with lower QoS
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo/#"), qos: 0}}, []byte{0})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Publish and test msg received twice
+	testMQTTPublish(t, mcp, r, 0, false, false, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("msg"))
+	checkWCSub(0)
+}
+
+func TestMQTTSubPropagation(t *testing.T) {
+	o := testMQTTDefaultOptions()
+	o.Cluster.Host = "127.0.0.1"
+	o.Cluster.Port = -1
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	o2 := DefaultOptions()
+	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o.Cluster.Port))
+	s2 := RunServer(o2)
+	defer s2.Shutdown()
+
+	checkClusterFormed(t, s, s2)
+
+	nc := natsConnect(t, s2.ClientURL())
+	defer nc.Close()
+
+	mc, r := testMQTTConnect(t, &mqttConnInfo{cleanSess: true}, o.MQTT.Host, o.MQTT.Port)
+	defer mc.Close()
+	testMQTTCheckConnAck(t, r, mqttConnAckRCConnectionAccepted, false)
+
+	testMQTTSub(t, 1, mc, r, []*mqttFilter{&mqttFilter{filter: []byte("foo/#"), qos: 0}}, []byte{0})
+	testMQTTFlush(t, mc, nil, r)
+
+	// Because in MQTT foo/# means foo.> but also foo, check that this is propagated
+	checkSubInterest(t, s2, globalAccountName, "foo", time.Second)
+
+	// Publish on foo.bar, foo./ and foo and we should receive them
+	natsPub(t, nc, "foo.bar", []byte("hello"))
+	testMQTTCheckPubMsg(t, mc, r, "foo/bar", 0, []byte("hello"))
+
+	natsPub(t, nc, "foo./", []byte("from"))
+	testMQTTCheckPubMsg(t, mc, r, "foo/", 0, []byte("from"))
+
+	natsPub(t, nc, "foo", []byte("NATS"))
+	testMQTTCheckPubMsg(t, mc, r, "foo", 0, []byte("NATS"))
 }
 
 func testMQTTExpectDisconnect(t testing.TB, c net.Conn) {

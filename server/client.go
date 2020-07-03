@@ -407,7 +407,7 @@ type subscription struct {
 	max     int64
 	qw      int32
 	closed  int32
-	qos     byte // quality of service (for mqtt)
+	qos     byte
 }
 
 // Indicate that this subscription is closed.
@@ -2104,13 +2104,23 @@ func splitArg(arg []byte) [][]byte {
 	return args
 }
 
+type subOpts struct {
+	subject   []byte
+	queue     []byte
+	sid       []byte
+	key       []byte
+	noForward bool
+	icb       msgHandler
+	qos       byte
+}
+
 func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) {
 	// Copy so we do not reference a potentially large buffer
 	// FIXME(dlc) - make more efficient.
 	arg := make([]byte, len(argo))
 	copy(arg, argo)
 	args := splitArg(arg)
-	sub := &subscription{client: c}
+	sub := subOpts{noForward: noForward}
 	switch len(args) {
 	case 2:
 		sub.subject = args[0]
@@ -2123,8 +2133,20 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 	default:
 		return nil, fmt.Errorf("processSub Parse Error: '%s'", arg)
 	}
+	sub.key = sub.sid
+	return c.processSubWithOpts(&sub)
+}
 
+func (c *client) processSubWithOpts(o *subOpts) (*subscription, error) {
 	c.mu.Lock()
+	sub := &subscription{
+		client:  c,
+		subject: o.subject,
+		queue:   o.queue,
+		sid:     o.sid,
+		icb:     o.icb,
+		qos:     o.qos,
+	}
 
 	// Indicate activity.
 	c.in.subs++
@@ -2134,17 +2156,12 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 	acc := c.acc
 	srv := c.srv
 
-	var sid string
-	if c.mqtt != nil {
-		sid = string(sub.subject)
-	} else {
-		sid = string(sub.sid)
-	}
+	key := string(o.key)
 
 	// This check does not apply to SYSTEM or JETSTREAM or ACCOUNT clients (because they don't have a `nc`...)
 	if c.isClosed() && (kind != SYSTEM && kind != JETSTREAM && kind != ACCOUNT) {
 		c.mu.Unlock()
-		return sub, nil
+		return nil, nil
 	}
 
 	// Check permissions if applicable.
@@ -2180,17 +2197,19 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 	var err error
 
 	// Subscribe here.
-	es := c.subs[sid]
+	es := c.subs[key]
 	if es == nil {
-		c.subs[sid] = sub
+		c.subs[key] = sub
 		if acc != nil && acc.sl != nil {
 			err = acc.sl.Insert(sub)
 			if err != nil {
-				delete(c.subs, sid)
+				delete(c.subs, key)
 			} else {
 				updateGWs = c.srv.gateway.enabled
 			}
 		}
+	} else {
+		es.qos = o.qos
 	}
 	// Unlocked from here onward
 	c.mu.Unlock()
@@ -2216,7 +2235,7 @@ func (c *client) processSub(argo []byte, noForward bool) (*subscription, error) 
 		c.Errorf(err.Error())
 	}
 
-	if noForward {
+	if o.noForward {
 		return sub, nil
 	}
 
